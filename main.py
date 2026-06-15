@@ -29,7 +29,7 @@ K = np.array([
 ])
 dist = np.array([0.2821249450, -2.1993670285, 0.0003160934, 0.0022638987, 5.0754442194])
 TAMANO_ARUCO_M = 0.062   # lado del ArUco en metros
-SCALE_FACTOR = 0.5
+SCALE_FACTOR = 0.2       # Forzamos la baja resolución para SGBM
 IMG_L = os.path.join("FotosOriginales", "1.png")
 IMG_R = os.path.join("FotosOriginales", "2.png")
 OUTDIR = "output"
@@ -56,16 +56,6 @@ def cargar_imagenes():
 # ETAPA 9 — Rectificación estéreo (cv2.stereoRectify)
 # ============================================================================
 def rectificar_estereo(img_l, img_r, K, R, t):
-    """
-    Rectificación calibrada usando cv2.stereoRectify.
-    
-    Concepto: stereoRectify calcula rotaciones R1, R2 que alinean ambos planos
-    imagen para que las líneas epipolares sean horizontales. Se derivan de la
-    geometría epipolar (R, t): cada cámara se rota para que el epipolo se
-    envíe al infinito horizontal, haciendo las epipolares paralelas al eje x.
-    
-    dist_coeffs = 0 porque las imágenes ya están corregidas de distorsión.
-    """
     print("\n" + "="*70)
     print("ETAPA 9 — Rectificación estéreo (cv2.stereoRectify)")
     print("="*70)
@@ -88,15 +78,9 @@ def rectificar_estereo(img_l, img_r, K, R, t):
     print(f"  P1r:\n{P1r}")
     print(f"  P2r:\n{P2r}")
     
-    # Explicación conceptual
-    print("\n  NOTA: Las homografías de rectificación se derivan de E (y por tanto de R,t).")
-    print("  stereoRectify rota cada cámara (R1, R2) para que los planos imagen sean")
-    print("  coplanares y las líneas epipolares perfectamente horizontales.")
-    
     return img_rect1, img_rect2, R1, R2, P1r, P2r, Q
 
 def calcular_error_vertical(img_rect2, pts_l, pts_r, K, R1, R2, P1r, P2r):
-    """Calcula error vertical medio y aplica corrección afín en Y para eliminar el residual."""
     dist_rect = np.zeros((1, 5), dtype=float)
     ptsL_rect = cv2.undistortPoints(pts_l.reshape(-1,1,2).astype(np.float64),
                                      K, dist_rect, R=R1, P=P1r).reshape(-1, 2)
@@ -105,12 +89,10 @@ def calcular_error_vertical(img_rect2, pts_l, pts_r, K, R1, R2, P1r, P2r):
     
     dy_before = np.mean(np.abs(ptsL_rect[:,1] - ptsR_rect[:,1]))
     
-    # Corrección Bilineal (solo en Y) para alinear suave y precisamente
-    # Evita la distorsión loca de los extremos que causa RBF
+    # Corrección Bilineal (solo en Y)
     X_r, Y_r = ptsR_rect[:, 0], ptsR_rect[:, 1]
     Y_l = ptsL_rect[:, 1]
     
-    # 1. Ajuste Inverso (Para remap: Destino -> Origen)
     A_inv = np.column_stack([X_r, Y_l, X_r*Y_l, np.ones_like(X_r)])
     p_inv, _, _, _ = np.linalg.lstsq(A_inv, Y_r, rcond=None)
     
@@ -120,7 +102,6 @@ def calcular_error_vertical(img_rect2, pts_l, pts_r, K, R1, R2, P1r, P2r):
     
     img_rect2_opt = cv2.remap(img_rect2, map_x, map2y_opt, cv2.INTER_LINEAR)
     
-    # 2. Ajuste Directo (Para calcular el nuevo Y de los puntos)
     A_fwd = np.column_stack([X_r, Y_r, X_r*Y_r, np.ones_like(X_r)])
     p_fwd, _, _, _ = np.linalg.lstsq(A_fwd, Y_l, rcond=None)
     
@@ -139,11 +120,12 @@ def calcular_error_vertical(img_rect2, pts_l, pts_r, K, R1, R2, P1r, P2r):
 def calcular_disparidad(imgL_rect, imgR_rect, P1r, P2r, ptsL_in, ptsR_in,
                          K, R1, R2, C1, C2, outdir):
     print("\n" + "="*70)
-    print("ETAPA 10 — Mapa de disparidad denso (StereoSGBM)")
+    print("ETAPA 10 — Mapa de disparidad denso (StereoSGBM + WLS limpio)")
     print("="*70)
 
-    SCALE_FACTOR = 0.5
-    assert SCALE_FACTOR in [0.5, 0.25, 0.125], "Usa potencias de 1/2"
+    # 1. Aplicamos el factor de escala
+    SCALE_FACTOR = 0.2
+    assert SCALE_FACTOR in [0.5, 0.25, 0.2, 0.125], "Usa factores lógicos"
 
     h_orig, w_orig = imgL_rect.shape[:2]
     new_w, new_h = int(w_orig * SCALE_FACTOR), int(h_orig * SCALE_FACTOR)
@@ -152,11 +134,8 @@ def calcular_disparidad(imgL_rect, imgR_rect, P1r, P2r, ptsL_in, ptsR_in,
     grayL = cv2.cvtColor(imgL_rect_small, cv2.COLOR_BGR2GRAY)
     grayR = cv2.cvtColor(imgR_rect_small, cv2.COLOR_BGR2GRAY)
     
-    # MÁSCARA ESTRICTA DE ZONA VÁLIDA (para evitar que WLS reviente en los bordes negros de alpha=1)
+    # Máscara para bordes negros de rectificación
     mask_valid = (grayL > 5) & (grayR > 5)
-
-    P1r_scaled = P1r.copy(); P1r_scaled[0, :] *= SCALE_FACTOR; P1r_scaled[1, :] *= SCALE_FACTOR
-    P2r_scaled = P2r.copy(); P2r_scaled[0, :] *= SCALE_FACTOR; P2r_scaled[1, :] *= SCALE_FACTOR
 
     dist_rect = np.zeros((1, 5), dtype=float)
 
@@ -165,178 +144,115 @@ def calcular_disparidad(imgL_rect, imgR_rect, P1r, P2r, ptsL_in, ptsR_in,
     ptsR_rect = cv2.undistortPoints(ptsR_in.reshape(-1, 1, 2).astype(np.float64), K, dist_rect, R=R2, P=P2r)
 
     disp_known = (ptsL_rect[:, 0, 0] - ptsR_rect[:, 0, 0]) * SCALE_FACTOR
-    min_disp = max(0, int(np.floor(np.min(disp_known))) - 5)
-    max_disp = int(np.ceil(np.max(disp_known))) + 10
+    
+    # 2. Rango de disparidad
+    min_disp = 0
+    max_disp = int(np.ceil(np.max(disp_known))) + 64
     num_disp = ((max_disp - min_disp) // 16 + 1) * 16
-    print(f"  Rango disparidad: {min_disp} - {max_disp}, numDisparities={num_disp}")
+    print(f"  Rango disparidad: {min_disp} - {min_disp+num_disp}, numDisparities={num_disp}")
 
-    # --- Parámetros de StereoSGBM de TU código ---
-    block_size = 5
-    canales = 1
+    # 3. Parámetros de StereoSGBM optimizados
+    block_size = 7
 
     matcher = cv2.StereoSGBM_create(
         minDisparity=min_disp,
         numDisparities=num_disp,
         blockSize=block_size,
-        P1=8 * canales * block_size**2,
-        P2=16 * canales * block_size**2,
-        disp12MaxDiff=2,
-        uniquenessRatio=5,
+        P1=8 * 1 * block_size**2,
+        P2=32 * 1 * block_size**2,
+        disp12MaxDiff=10,
+        uniquenessRatio=10,
         speckleWindowSize=100,
         speckleRange=2,
         preFilterCap=63,
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
     )
 
-    disp_raw = matcher.compute(grayL, grayR).astype(np.float32) / 16.0
-    
-    # Forzar valores no válidos fuera de la imagen ANTES del WLS para evitar artefactos gigantes
-    disp_raw[~mask_valid] = min_disp - 1.0
+    # 4. Computar y pasar por el filtro WLS
+    disp_raw_int16 = matcher.compute(grayL, grayR)
 
     try:
         from cv2 import ximgproc
-        wls = ximgproc.createDisparityWLSFilter(matcher_left=matcher)
         right_matcher = ximgproc.createRightMatcher(matcher)
-        disp_right = right_matcher.compute(grayR, grayL).astype(np.float32) / 16.0
-        disp_filtered = wls.filter(disp_raw, grayL, disparity_map_right=disp_right).astype(np.float32)
-        print("  Filtro WLS aplicado con éxito.")
+        disp_right_int16 = right_matcher.compute(grayR, grayL)
+        
+        wls_filter = ximgproc.createDisparityWLSFilter(matcher_left=matcher)
+        wls_filter.setLambda(8000.0)
+        wls_filter.setSigmaColor(1.5)
+        
+        disp_filtered_int16 = wls_filter.filter(disp_raw_int16, imgL_rect_small, disparity_map_right=disp_right_int16)
+        print("  Filtro estéreo WLS aplicado con éxito.")
+        disp_filtered = disp_filtered_int16.astype(np.float32) / 16.0
     except (ImportError, AttributeError, Exception):
-        disp_filtered = disp_raw.copy()
-        print("  Filtro WLS no disponible en esta instalación de OpenCV. Se usa el mapa base.")
+        disp_filtered = disp_raw_int16.astype(np.float32) / 16.0
+        print("  Filtro WLS no disponible. Usando SGBM crudo.")
 
-    # Filtro de mediana inicial
-    disp_filtered = np.nan_to_num(disp_filtered, nan=0.0).astype(np.float32)
-    disp_median = cv2.medianBlur(disp_filtered, 5)
-    
-    # Clamp agresivo para descartar ruido del WLS en los bordes negros
-    disp_median[disp_median <= min_disp] = np.nan
-    disp_median[disp_median >= min_disp + num_disp + 10] = np.nan
-    disp_median[~mask_valid] = np.nan  # Mantenemos los bordes negros como NaN puros
-    
-    disp_final = disp_median
+    # 5. Limpieza de ruido (SIN Inpainting para evitar falsos positivos)
+    disp_clean = np.nan_to_num(disp_filtered, nan=0.0).astype(np.float32)
+    disp_clean[disp_clean <= min_disp] = np.nan
+    disp_clean[disp_clean >= min_disp + num_disp] = np.nan
+    disp_clean[~mask_valid] = np.nan
 
-    # ==============================================================================
-    # --- DETECCIÓN AUTOMÁTICA ADAPTATIVA DEL ANCHO DE OCLUSIÓN LATERAL ---
-    # ==============================================================================
-    valid_indices = [np.where(~np.isnan(disp_final[r]))[0] for r in range(disp_final.shape[0])]
-    first_valid_cols = [idx[0] for idx in valid_indices if len(idx) > 0]
-    last_valid_cols = [idx[-1] for idx in valid_indices if len(idx) > 0]
-
-    if len(first_valid_cols) > 0:
-        crop_left_small = min(int(np.percentile(first_valid_cols, 90)) + 15, int(new_w * 0.20))
-    else:
-        crop_left_small = int(num_disp + 15)
-
-    if len(last_valid_cols) > 0:
-        crop_right_small = min(disp_final.shape[1] - int(np.percentile(last_valid_cols, 10)) + 15, int(new_w * 0.15))
-    else:
-        crop_right_small = 15
-    # ==============================================================================
-
-    # --- INPAINTING ULTRA-LOCAL CON PRESERVACIÓN DE BORDES (NAVIER-STOKES) ---
-    invalid_mask = np.isnan(disp_final)
-    # IMPORTANTE: Inpaintamos SOLO dentro de la imagen, no los inmensos bordes negros de alpha=1
-    inpaint_target = invalid_mask & mask_valid
-    valid_data_mask = ~invalid_mask & mask_valid
-
-    if np.any(valid_data_mask):
-        d_min = float(np.nanmin(disp_final[valid_data_mask]))
-        d_max = float(np.nanmax(disp_final[valid_data_mask]))
-        d_range = d_max - d_min if (d_max - d_min) > 1e-9 else 1.0
-        
-        # Normalizamos
-        disp_uint8 = np.zeros_like(disp_final, dtype=np.uint8)
-        disp_uint8[valid_data_mask] = np.clip(
-            255.0 * (disp_final[valid_data_mask] - d_min) / d_range, 0, 255
-        ).astype(np.uint8)
-        
-        # Máscara de inpainting (solo agujeros internos)
-        inpaint_mask = (inpaint_target * 255).astype(np.uint8)
-        
-        # Usamos Navier-Stokes (INPAINT_NS) con radio=1 para rellenar sin difuminar bordes
-        disp_uint8_inpainted = cv2.inpaint(disp_uint8, inpaint_mask, inpaintRadius=1, flags=cv2.INPAINT_NS)
-        
-        # Desnormalizamos
-        disp_inpainted_float = d_min + (disp_uint8_inpainted.astype(np.float32) / 255.0) * d_range
-        
-        # Conservamos los píxeles originales calculados por SGBM y solo rellenamos los vacíos internos
-        disp_final_clean = disp_final.copy()
-        disp_final_clean[inpaint_target] = disp_inpainted_float[inpaint_target]
-        disp_final = disp_final_clean
-
-    # Escalado de la disparidad al tamaño original
+    # 6. Escalado de la disparidad al tamaño original
     if SCALE_FACTOR != 1.0:
-        # Poner los NaN a 0 temporalmente para el resize
-        disp_clean_resize = np.nan_to_num(disp_final, nan=0.0).astype(np.float32)
+        disp_clean_resize = np.nan_to_num(disp_clean, nan=0.0).astype(np.float32)
         disp_up = cv2.resize(
             disp_clean_resize,
             (w_orig, h_orig),
             interpolation=cv2.INTER_NEAREST,
-        ) / SCALE_FACTOR
+        ) / SCALE_FACTOR  # Factor inverso aplicado a la profundidad
         
         mask = cv2.resize(
-            np.isfinite(disp_final).astype(np.uint8),
+            np.isfinite(disp_clean).astype(np.uint8),
             (w_orig, h_orig),
             interpolation=cv2.INTER_NEAREST,
         )
         disp_up[mask == 0] = np.nan
         disp = disp_up
     else:
-        disp = disp_final.copy()
+        disp = disp_clean.copy()
 
-    # ==============================================================================
-    # --- ANULACIÓN AUTOMÁTICA ADAPTATIVA EN RESOLUCIÓN COMPLETA ---
-    # ==============================================================================
-    crop_left = int(crop_left_small / SCALE_FACTOR)
-    crop_right = int(crop_right_small / SCALE_FACTOR)
-
+    # Anulación de bordes laterales ciegos
+    crop_left = int((num_disp + 15) / SCALE_FACTOR)
     disp[:, :crop_left] = np.nan
-    disp[:, -crop_right:] = np.nan
-    # ==============================================================================
+    disp[:, -15:] = np.nan
 
     valid = np.isfinite(disp) & (disp > 0)
     print(f"  Disparidad válida: {100.0 * valid.mean():.1f}% de píxeles")
-    if np.any(valid):
-        print(f"  d (px) min/med/max: {np.nanmin(disp[valid]):.2f} / {np.nanmedian(disp[valid]):.2f} / {np.nanmax(disp[valid]):.2f}")
 
     # Profundidad métrica real Z = fB/d
     fx_rect = float(P1r[0, 0])
     B_rect = float(abs(P2r[0, 3] / P2r[0, 0])) if abs(P2r[0, 0]) > 1e-9 else float(np.linalg.norm(C2 - C1))
     depth = np.full_like(disp, np.nan)
     depth[valid] = (fx_rect * B_rect) / disp[valid]
-    print(f"  f (rect) = {fx_rect:.2f} px, B = {B_rect:.4f} m")
-    if np.any(np.isfinite(depth)):
-        print(f"  Z aprox (m) min/med/max: {np.nanmin(depth[valid]):.3f} / {np.nanmedian(depth[valid]):.3f} / {np.nanmax(depth[valid]):.3f}")
 
-    # Visualización del mapa de disparidad crudo (contraste optimizado)
+    # Visualización
     fig1 = plt.figure(figsize=(12, 5))
     valid_disp = disp[valid]
     if len(valid_disp) > 0:
         vmin = float(np.percentile(valid_disp, 5))
         vmax = float(np.percentile(valid_disp, 95))
-        print(f"  Rango visualizado: {vmin:.1f} - {vmax:.1f} px")
     else:
         vmin, vmax = 0.0, 1.0
 
-    # Submuestreo para visualización
     disp_viz_step = max(1, int(np.round(disp.shape[1] / 1600.0)))
     disp_viz = disp[::disp_viz_step, ::disp_viz_step]
 
-    # Mostramos el mapa de disparidad crudo
     import matplotlib.cm as cm
     cmap = cm.plasma
-    cmap.set_bad(color='white') # Fondo blanco para las oclusiones (los NaNs)
+    # Pinta el fondo (pared sin textura) de blanco puro para separarlo del robot
+    cmap.set_bad(color='white') 
     plt.imshow(disp_viz, cmap=cmap, vmin=vmin, vmax=vmax)
 
     plt.colorbar(label='Disparidad (px)')
-    plt.title('Mapa de disparidad (contraste optimizado - bordes definidos)')
+    plt.title('Mapa de disparidad denso')
     plt.axis('off')
 
     fig1.savefig(os.path.join(outdir, 'mapa_disparidad_2D.pdf'), bbox_inches='tight')
     fig1.savefig(os.path.join(outdir, 'mapa_disparidad_2D.png'), dpi=150, bbox_inches='tight')
     plt.close(fig1)
 
-    # Perfiles de disparidad en dos alturas
+    # Perfiles
     h_rect, w_rect = disp.shape
     row_a = int(0.35 * h_rect)
     row_b = int(0.65 * h_rect)
@@ -347,23 +263,15 @@ def calcular_disparidad(imgL_rect, imgR_rect, P1r, P2r, ptsL_in, ptsR_in,
     plt.plot(x, disp[row_b, :], label=f'Perfil fila {row_b}', alpha=0.9)
     plt.xlabel('Columna (px)')
     plt.ylabel('Disparidad (px)')
-    plt.title('Perfiles de disparidad en dos alturas')
+    plt.title('Perfiles de disparidad')
     plt.legend()
     plt.grid(True, alpha=0.25)
 
-    fig2.savefig(os.path.join(outdir, 'perfiles_disparidad.pdf'), bbox_inches='tight')
     fig2.savefig(os.path.join(outdir, 'perfiles_disparidad.png'), dpi=150, bbox_inches='tight')
     plt.close(fig2)
 
-    # Comentario automático de calidad
-    frac_invalid = 1.0 - valid.mean()
-    print()
-    print('  Diagnóstico rápido del mapa de disparidad:')
-    print(f"  - Píxeles inválidos: {100.0 * frac_invalid:.1f}%")
-    print('  - Fallos típicos esperables: oclusiones, reflejos, zonas sin textura y bordes finos.')
-    print('  - Mejoras aplicadas: SGBM de bordes duros, inpainting local adaptativo, mediana y percentiles.')
-
     return disp, depth
+
 # ============================================================================
 # RESUMEN FINAL — 12 preguntas del informe
 # ============================================================================
@@ -458,9 +366,7 @@ def main():
     # --- Etapa 5: Matriz Esencial ---
     E = calcular_esencial(F, K)
     
-    # Visualizar líneas epipolares desde E (transformando a F equivalente para comparar)
-    # E induce líneas en coordenadas normalizadas; las convertimos a píxel:
-    # F_from_E = K^-T · E · K^-1
+    # Visualizar líneas epipolares desde E 
     K_inv = np.linalg.inv(K)
     F_from_E = K_inv.T @ E @ K_inv
     F_from_E = F_from_E / np.linalg.norm(F_from_E)
@@ -479,30 +385,23 @@ def main():
     print(f"  Factor de escala: {factor:.6f}")
     print(f"  t escalado: {t_esc.ravel()}")
     
-    # Verificación de escala: distancia entre esquinas 0 y 1 del primer marcador
     if len(X) >= 2:
         d01 = np.linalg.norm(X[0] - X[1])
         print(f"  Distancia 3D esquina 0→1 (primer ArUco): {d01:.4f} m (real: {TAMANO_ARUCO_M:.4f} m)")
     
-    # Error de reproyección
     err1, err2 = error_reproyeccion(K, R, t_esc, X, p1_in, p2_in)
     print(f"  Error reproyección: cam1={err1:.4f} px, cam2={err2:.4f} px")
     
-    # Visualización 3D
     visualizar_3d(X, mids_in, R, t_esc, OUTDIR)
     
     # --- Etapa 9: Rectificación ---
     img_rect1, img_rect2, R1, R2, P1r, P2r, Q = rectificar_estereo(
         img_l, img_r, K, R, t_esc)
     
-    # Error vertical y ajuste afín
     ptsL_rect, ptsR_rect, img_rect2_opt, dy_before, dy_after = calcular_error_vertical(
         img_rect2, p1_in, p2_in, K, R1, R2, P1r, P2r)
     
-    # Reemplazar la imagen derecha con la versión alineada perfectamente
     img_rect2 = img_rect2_opt
-    
-    # Visualización rectificación (dibujando líneas por las correspondencias)
     visualizar_rectificacion(img_rect1, img_rect2, OUTDIR, pts_rect=ptsL_rect)
     
     # --- Etapa 10: Disparidad densa ---
@@ -521,7 +420,6 @@ def main():
     print("PIPELINE COMPLETADO")
     print(f"Figuras guardadas en: {OUTDIR}/")
     print("="*70)
-
 
 if __name__ == "__main__":
     main()
