@@ -13,9 +13,13 @@ from geometria_epipolar import (obtener_correspondencias, ocho_puntos_normalizad
                                  ransac_fundamental, calcular_esencial,
                                  normalizar_puntos, _error_epipolar_simetrico)
 from reconstruccion import (seleccionar_pose, fijar_escala_metrica,
-                             triangular_puntos, error_reproyeccion, visualizar_reconstruccion_3d)
+                             triangular_puntos, error_reproyeccion)
 from visualizacion import (visualizar_correspondencias, visualizar_lineas_epipolares,
-                            visualizar_rectificacion)
+                            visualizar_rectificacion, visualizar_reconstruccion_3d,
+                            visualizar_mapa_disparidad_2d, visualizar_perfiles_disparidad)
+from pipeline_denso import (rectificar_estereo, calcular_error_vertical, 
+                            computar_mapa_disparidad, calcular_profundidad,
+                            imprimir_resumen)
 
 # ============================================================================
 # CONFIGURACIÓN
@@ -50,287 +54,7 @@ def cargar_imagenes():
             print(f"  ⚠️  Resolución inesperada (esperada {EXPECTED[1]}x{EXPECTED[0]})")
     return il, ir
 
-# ============================================================================
-# ETAPA 9 — Rectificación estéreo (cv2.stereoRectify)
-# ============================================================================
-def rectificar_estereo(img_l, img_r, K, R, t):
-    print("\n" + "="*70)
-    print("ETAPA 9 — Rectificación estéreo (cv2.stereoRectify)")
-    print("="*70)
-    h, w = img_l.shape[:2]
-    dist_coeffs = np.zeros(5)
-    
-    R1, R2, P1r, P2r, Q, _, _ = cv2.stereoRectify(
-        K, dist_coeffs, K, dist_coeffs, (w, h), R, t,
-        flags=cv2.CALIB_ZERO_DISPARITY, alpha=1
-    )
-    
-    map1x, map1y = cv2.initUndistortRectifyMap(K, dist_coeffs, R1, P1r, (w, h), cv2.CV_32FC1)
-    map2x, map2y = cv2.initUndistortRectifyMap(K, dist_coeffs, R2, P2r, (w, h), cv2.CV_32FC1)
-    
-    img_rect1 = cv2.remap(img_l, map1x, map1y, cv2.INTER_LINEAR)
-    img_rect2 = cv2.remap(img_r, map2x, map2y, cv2.INTER_LINEAR)
-    
-    print(f"  R1:\n{R1}")
-    print(f"  R2:\n{R2}")
-    print(f"  P1r:\n{P1r}")
-    print(f"  P2r:\n{P2r}")
-    
-    return img_rect1, img_rect2, R1, R2, P1r, P2r, Q
 
-def calcular_error_vertical(img_rect2, pts_l, pts_r, K, R1, R2, P1r, P2r):
-    dist_rect = np.zeros((1, 5), dtype=float)
-    ptsL_rect = cv2.undistortPoints(pts_l.reshape(-1,1,2).astype(np.float64),
-                                     K, dist_rect, R=R1, P=P1r).reshape(-1, 2)
-    ptsR_rect = cv2.undistortPoints(pts_r.reshape(-1,1,2).astype(np.float64),
-                                     K, dist_rect, R=R2, P=P2r).reshape(-1, 2)
-    
-    dy_before = np.mean(np.abs(ptsL_rect[:,1] - ptsR_rect[:,1]))
-    
-    # Corrección Bilineal (solo en Y)
-    X_r, Y_r = ptsR_rect[:, 0], ptsR_rect[:, 1]
-    Y_l = ptsL_rect[:, 1]
-    
-    A_inv = np.column_stack([X_r, Y_l, X_r*Y_l, np.ones_like(X_r)])
-    p_inv, _, _, _ = np.linalg.lstsq(A_inv, Y_r, rcond=None)
-    
-    h, w = img_rect2.shape[:2]
-    map_x, map_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    map2y_opt = (p_inv[0]*map_x + p_inv[1]*map_y + p_inv[2]*(map_x*map_y) + p_inv[3]).astype(np.float32)
-    
-    img_rect2_opt = cv2.remap(img_rect2, map_x, map2y_opt, cv2.INTER_LINEAR)
-    
-    A_fwd = np.column_stack([X_r, Y_r, X_r*Y_r, np.ones_like(X_r)])
-    p_fwd, _, _, _ = np.linalg.lstsq(A_fwd, Y_l, rcond=None)
-    
-    ptsR_rect_opt = ptsR_rect.copy()
-    ptsR_rect_opt[:, 1] = p_fwd[0]*X_r + p_fwd[1]*Y_r + p_fwd[2]*(X_r*Y_r) + p_fwd[3]
-    
-    dy_after = np.mean(np.abs(ptsL_rect[:,1] - ptsR_rect_opt[:,1]))
-    
-    print(f"  Error vertical ANTES de ajuste:   {dy_before:.4f} px")
-    print(f"  Error vertical DESPUÉS de Bilineal: {dy_after:.4f} px")
-    return ptsL_rect, ptsR_rect_opt, img_rect2_opt, dy_before, dy_after
-
-# ============================================================================
-# ETAPA 10 — Mapa de disparidad denso (StereoSGBM)
-# ============================================================================
-def calcular_disparidad(imgL_rect, imgR_rect, P1r, P2r, ptsL_in, ptsR_in,
-                         K, R1, R2, C1, C2, outdir):
-    print("\n" + "="*70)
-    print("ETAPA 10 — Mapa de disparidad denso (StereoSGBM + WLS limpio)")
-    print("="*70)
-
-    # 1. Aplicamos el factor de escala
-    SCALE_FACTOR = 0.2
-    assert SCALE_FACTOR in [0.5, 0.25, 0.2, 0.125], "Usa factores lógicos"
-
-    h_orig, w_orig = imgL_rect.shape[:2]
-    new_w, new_h = int(w_orig * SCALE_FACTOR), int(h_orig * SCALE_FACTOR)
-    imgL_rect_small = cv2.resize(imgL_rect, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    imgR_rect_small = cv2.resize(imgR_rect, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    grayL = cv2.cvtColor(imgL_rect_small, cv2.COLOR_BGR2GRAY)
-    grayR = cv2.cvtColor(imgR_rect_small, cv2.COLOR_BGR2GRAY)
-    
-    # Máscara para bordes negros de rectificación
-    mask_valid = (grayL > 5) & (grayR > 5)
-
-    dist_rect = np.zeros((1, 5), dtype=float)
-
-    # Proyectamos los puntos de validación
-    ptsL_rect = cv2.undistortPoints(ptsL_in.reshape(-1, 1, 2).astype(np.float64), K, dist_rect, R=R1, P=P1r)
-    ptsR_rect = cv2.undistortPoints(ptsR_in.reshape(-1, 1, 2).astype(np.float64), K, dist_rect, R=R2, P=P2r)
-
-    disp_known = (ptsL_rect[:, 0, 0] - ptsR_rect[:, 0, 0]) * SCALE_FACTOR
-    
-    # 2. Rango de disparidad
-    min_disp = 0
-    max_disp = int(np.ceil(np.max(disp_known))) + 64
-    num_disp = ((max_disp - min_disp) // 16 + 1) * 16
-    print(f"  Rango disparidad: {min_disp} - {min_disp+num_disp}, numDisparities={num_disp}")
-
-    # 3. Parámetros de StereoSGBM optimizados
-    block_size = 7
-
-    matcher = cv2.StereoSGBM_create(
-        minDisparity=min_disp,
-        numDisparities=num_disp,
-        blockSize=block_size,
-        P1=8 * 1 * block_size**2,
-        P2=32 * 1 * block_size**2,
-        disp12MaxDiff=10,
-        uniquenessRatio=10,
-        speckleWindowSize=100,
-        speckleRange=2,
-        preFilterCap=63,
-        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
-    )
-
-    # 4. Computar y pasar por el filtro WLS
-    disp_raw_int16 = matcher.compute(grayL, grayR)
-
-    try:
-        from cv2 import ximgproc
-        right_matcher = ximgproc.createRightMatcher(matcher)
-        disp_right_int16 = right_matcher.compute(grayR, grayL)
-        
-        wls_filter = ximgproc.createDisparityWLSFilter(matcher_left=matcher)
-        wls_filter.setLambda(8000.0)
-        wls_filter.setSigmaColor(1.5)
-        
-        disp_filtered_int16 = wls_filter.filter(disp_raw_int16, imgL_rect_small, disparity_map_right=disp_right_int16)
-        print("  Filtro estéreo WLS aplicado con éxito.")
-        disp_filtered = disp_filtered_int16.astype(np.float32) / 16.0
-    except (ImportError, AttributeError, Exception):
-        disp_filtered = disp_raw_int16.astype(np.float32) / 16.0
-        print("  Filtro WLS no disponible. Usando SGBM crudo.")
-
-    # 5. Limpieza de ruido (SIN Inpainting para evitar falsos positivos)
-    disp_clean = np.nan_to_num(disp_filtered, nan=0.0).astype(np.float32)
-    disp_clean[disp_clean <= min_disp] = np.nan
-    disp_clean[disp_clean >= min_disp + num_disp] = np.nan
-    disp_clean[~mask_valid] = np.nan
-
-    # 6. Escalado de la disparidad al tamaño original
-    if SCALE_FACTOR != 1.0:
-        disp_clean_resize = np.nan_to_num(disp_clean, nan=0.0).astype(np.float32)
-        disp_up = cv2.resize(
-            disp_clean_resize,
-            (w_orig, h_orig),
-            interpolation=cv2.INTER_NEAREST,
-        ) / SCALE_FACTOR  # Factor inverso aplicado a la profundidad
-        
-        mask = cv2.resize(
-            np.isfinite(disp_clean).astype(np.uint8),
-            (w_orig, h_orig),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        disp_up[mask == 0] = np.nan
-        disp = disp_up
-    else:
-        disp = disp_clean.copy()
-
-    # Anulación de bordes laterales ciegos
-    crop_left = int((num_disp + 15) / SCALE_FACTOR)
-    disp[:, :crop_left] = np.nan
-    disp[:, -15:] = np.nan
-
-    valid = np.isfinite(disp) & (disp > 0)
-    print(f"  Disparidad válida: {100.0 * valid.mean():.1f}% de píxeles")
-
-    # Profundidad métrica real Z = fB/d
-    fx_rect = float(P1r[0, 0])
-    B_rect = float(abs(P2r[0, 3] / P2r[0, 0])) if abs(P2r[0, 0]) > 1e-9 else float(np.linalg.norm(C2 - C1))
-    depth = np.full_like(disp, np.nan)
-    depth[valid] = (fx_rect * B_rect) / disp[valid]
-
-    # Visualización
-    fig1 = plt.figure(figsize=(12, 5))
-    valid_disp = disp[valid]
-    if len(valid_disp) > 0:
-        vmin = float(np.percentile(valid_disp, 5))
-        vmax = float(np.percentile(valid_disp, 95))
-    else:
-        vmin, vmax = 0.0, 1.0
-
-    disp_viz_step = max(1, int(np.round(disp.shape[1] / 1600.0)))
-    disp_viz = disp[::disp_viz_step, ::disp_viz_step]
-
-    import matplotlib.cm as cm
-    cmap = cm.plasma
-    # Pinta el fondo (pared sin textura) de blanco puro para separarlo del robot
-    cmap.set_bad(color='white') 
-    plt.imshow(disp_viz, cmap=cmap, vmin=vmin, vmax=vmax)
-
-    plt.colorbar(label='Disparidad (px)')
-    plt.title('Mapa de disparidad denso')
-    plt.axis('off')
-
-    fig1.savefig(os.path.join(outdir, 'mapa_disparidad_2D.pdf'), bbox_inches='tight')
-    fig1.savefig(os.path.join(outdir, 'mapa_disparidad_2D.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig1)
-
-    # Perfiles
-    h_rect, w_rect = disp.shape
-    row_a = int(0.35 * h_rect)
-    row_b = int(0.65 * h_rect)
-    x = np.arange(w_rect)
-
-    fig2 = plt.figure(figsize=(14, 5))
-    plt.plot(x, disp[row_a, :], label=f'Perfil fila {row_a}', alpha=0.9)
-    plt.plot(x, disp[row_b, :], label=f'Perfil fila {row_b}', alpha=0.9)
-    plt.xlabel('Columna (px)')
-    plt.ylabel('Disparidad (px)')
-    plt.title('Perfiles de disparidad')
-    plt.legend()
-    plt.grid(True, alpha=0.25)
-
-    fig2.savefig(os.path.join(outdir, 'perfiles_disparidad.png'), dpi=150, bbox_inches='tight')
-    plt.close(fig2)
-
-    return disp, depth
-
-# ============================================================================
-# RESUMEN FINAL — 12 preguntas del informe
-# ============================================================================
-def imprimir_resumen(K, err_repro1, err_repro2, n_corresp, n_inliers, n_total,
-                     err_epi_medio, dy_before, dy_after, depth):
-    print("\n" + "="*70)
-    print("RESUMEN FINAL — Respuestas a las 12 preguntas del informe")
-    print("="*70)
-    
-    print(f"\n1. MATRIZ INTRÍNSECA K:")
-    print(f"   fx={K[0,0]:.4f}, fy={K[1,1]:.4f}, cx={K[0,2]:.4f}, cy={K[1,2]:.4f}")
-    
-    print(f"\n2. ERROR DE REPROYECCIÓN (calibración): 0.96 px")
-    print(f"   Error reproyección post-triangulación: cam1={err_repro1:.4f} px, cam2={err_repro2:.4f} px")
-    
-    print(f"\n3. CORRESPONDENCIAS PARA F: {n_corresp} puntos (esquinas de ArUco)")
-    
-    pct = 100.0*n_inliers/n_total
-    print(f"\n4. INLIERS TRAS RANSAC: {n_inliers}/{n_total} ({pct:.1f}%)")
-    
-    print(f"\n5. VERIFICACIÓN xr^T·F·xl ≈ 0: error epipolar medio = {err_epi_medio:.4f} px")
-    
-    print(f"\n6. DIFERENCIA ENTRE F Y E:")
-    print(f"   F opera en coordenadas de píxel (incorpora K).")
-    print(f"   E opera en coordenadas normalizadas/calibradas (solo geometría extrínseca R,t).")
-    print(f"   Relación: E = K^T · F · K. E tiene exactamente 5 DoF (3 rotación + 2 dirección traslación).")
-    
-    print(f"\n7. ¿POR QUÉ t DE E NO TIENE ESCALA MÉTRICA?")
-    print(f"   La matriz esencial se calcula a partir de correspondencias de imagen,")
-    print(f"   que son invariantes ante escalado de la escena. t se recupera normalizado (||t||=1).")
-    print(f"   La escala absoluta requiere información métrica externa.")
-    
-    print(f"\n8. FIJACIÓN DE ESCALA:")
-    print(f"   Se usó el tamaño real del lado del ArUco ({TAMANO_ARUCO_M*100:.1f} cm).")
-    print(f"   Factor = tamaño_real / distancia_3D_reconstruida entre esquinas consecutivas.")
-    
-    print(f"\n9. REDUCCIÓN DEL ERROR VERTICAL TRAS RECTIFICAR:")
-    print(f"   Antes: {dy_before:.2f} px → Después: {dy_after:.2f} px")
-    red = (1 - dy_after/(dy_before+1e-15))*100
-    print(f"   Reducción: {red:.1f}%")
-    
-    print(f"\n10. ZONAS DONDE FALLA MÁS EL MAPA DE DISPARIDAD:")
-    print(f"    - Bordes laterales (oclusiones por paralaje)")
-    print(f"    - Superficies sin textura (paredes lisas, cielo)")
-    print(f"    - Reflejos especulares y zonas sobreexpuestas")
-    print(f"    - Bordes finos de objetos (discontinuidades de profundidad)")
-    
-    if np.any(np.isfinite(depth)):
-        z_med = np.nanmedian(depth)
-        z_min = np.nanmin(depth)
-        z_max = np.nanmax(depth)
-        print(f"\n11. COHERENCIA DE PROFUNDIDAD:")
-        print(f"    Z min/mediana/max: {z_min:.3f} / {z_med:.3f} / {z_max:.3f} m")
-        print(f"    Los valores deben ser coherentes con la distancia real de la escena.")
-    
-    print(f"\n12. POSIBLES MEJORAS DE CAPTURA:")
-    print(f"    - Mayor baseline entre vistas (mejora precisión de profundidad)")
-    print(f"    - Iluminación uniforme y difusa (reduce reflejos)")
-    print(f"    - Escenas con más textura (mejora matching SGBM)")
-    print(f"    - Más marcadores ArUco distribuidos por la escena")
-    print(f"    - Uso de trípode o rig estéreo fijo (reduce error de pose)")
 
 # ============================================================================
 # PIPELINE PRINCIPAL
@@ -406,13 +130,17 @@ def main():
     C1 = np.array([0.0, 0.0, 0.0])
     C2 = (-R.T @ t_esc).ravel()
     
-    disp, depth = calcular_disparidad(
+    disp = computar_mapa_disparidad(
         img_rect1, img_rect2, P1r, P2r,
-        p1_in, p2_in, K, R1, R2, C1, C2, OUTDIR)
+        p1_in, p2_in, K, R1, R2)
+    depth = calcular_profundidad(disp, P1r, P2r, C1, C2)
+    
+    visualizar_mapa_disparidad_2d(disp, OUTDIR)
+    visualizar_perfiles_disparidad(disp, OUTDIR)
     
     # --- Resumen final ---
     imprimir_resumen(K, err1, err2, len(p1_in), n_inliers, n_total,
-                     err_epi_medio, dy_before, dy_after, depth)
+                     err_epi_medio, dy_before, dy_after, depth, TAMANO_ARUCO_M)
     
     print("\n" + "="*70)
     print("PIPELINE COMPLETADO")

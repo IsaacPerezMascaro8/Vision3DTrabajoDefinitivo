@@ -139,3 +139,116 @@ def visualizar_rectificacion(img_rect1, img_rect2, outdir, pts_rect=None):
     cv2.imwrite(os.path.join(outdir, 'rectified_left.png'), img_rect1)
     cv2.imwrite(os.path.join(outdir, 'rectified_right.png'), img_rect2)
     print(f"  Guardado: {p}")
+
+
+def visualizar_mapa_disparidad_2d(disp, outdir):
+    valid = np.isfinite(disp) & (disp > 0)
+    fig1 = plt.figure(figsize=(12, 5))
+    valid_disp = disp[valid]
+    if len(valid_disp) > 0:
+        vmin = float(np.percentile(valid_disp, 5))
+        vmax = float(np.percentile(valid_disp, 95))
+    else:
+        vmin, vmax = 0.0, 1.0
+
+    disp_viz_step = max(1, int(np.round(disp.shape[1] / 1600.0)))
+    disp_viz = disp[::disp_viz_step, ::disp_viz_step]
+    
+    import matplotlib.cm as cm
+    cmap = cm.plasma
+    cmap.set_bad(color='white') 
+    plt.imshow(disp_viz, cmap=cmap, vmin=vmin, vmax=vmax)
+
+    plt.colorbar(label='Disparidad (px)')
+    plt.title('Mapa de disparidad denso')
+    plt.axis('off')
+
+    fig1.savefig(os.path.join(outdir, 'mapa_disparidad_2D.pdf'), bbox_inches='tight')
+    fig1.savefig(os.path.join(outdir, 'mapa_disparidad_2D.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig1)
+
+
+def visualizar_perfiles_disparidad(disp, outdir):
+    h_rect, w_rect = disp.shape
+    row_a = int(0.35 * h_rect)
+    row_b = int(0.65 * h_rect)
+    x = np.arange(w_rect)
+
+    fig2 = plt.figure(figsize=(14, 5))
+    plt.plot(x, disp[row_a, :], label=f'Perfil fila {row_a}', alpha=0.9)
+    plt.plot(x, disp[row_b, :], label=f'Perfil fila {row_b}', alpha=0.9)
+    plt.xlabel('Columna (px)')
+    plt.ylabel('Disparidad (px)')
+    plt.title('Perfiles de disparidad')
+    plt.legend()
+    plt.grid(True, alpha=0.25)
+
+    fig2.savefig(os.path.join(outdir, 'perfiles_disparidad.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig2)
+
+
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+_ARUCO_COLORS = [
+    '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+    '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990',
+    '#dcbeff', '#9A6324', '#800000', '#aaffc3', '#808000'
+]
+
+def _dibujar_frustum(ax, centro, R_cam, escala, color, alpha_face=0.12):
+    hw, hh, d = escala * 0.55, escala * 0.40, escala * 0.9
+    esquinas_local = np.array([[-hw, -hh, d], [hw, -hh, d], [hw, hh, d], [-hw, hh, d]])
+    esquinas_world = (R_cam @ esquinas_local.T).T + centro
+
+    poly = Poly3DCollection([esquinas_world.tolist()], alpha=alpha_face, facecolors=color, edgecolors=color, linewidths=1.2)
+    ax.add_collection3d(poly)
+
+    for corner in esquinas_world:
+        ax.plot([centro[0], corner[0]], [centro[1], corner[1]], [centro[2], corner[2]], color=color, linewidth=0.8, alpha=0.45)
+    for i in range(4):
+        j = (i + 1) % 4
+        ax.plot([esquinas_world[i, 0], esquinas_world[j, 0]], [esquinas_world[i, 1], esquinas_world[j, 1]], 
+                [esquinas_world[i, 2], esquinas_world[j, 2]], color=color, linewidth=1.2, alpha=0.7)
+
+def _configurar_ejes(ax, all_pts, titulo):
+    max_range = np.max(np.ptp(all_pts, axis=0)) * 0.6
+    if max_range < 1e-6:
+        max_range = 1.0
+    mid = np.mean(all_pts, axis=0)
+    ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
+    ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
+    ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
+    ax.invert_yaxis()
+    ax.invert_xaxis()
+    ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
+    ax.set_title(titulo)
+    ax.legend(loc='upper left', fontsize=9)
+    try:
+        ax.set_box_aspect([1, 1, 1])
+    except AttributeError:
+        pass
+
+def visualizar_reconstruccion_3d(puntos_3d, aruco_ids, R, t_escalada, titulo="Reconstrucción 3D métrica"):
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    unique_ids = np.unique(aruco_ids)
+    for idx, aid in enumerate(unique_ids):
+        color = _ARUCO_COLORS[idx % len(_ARUCO_COLORS)]
+        pts = puntos_3d[aruco_ids == aid]
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=color, s=60, alpha=0.9, edgecolors='k', label=f'ArUco ID {aid}')
+        for j, (x, y, z) in enumerate(pts):
+            ax.text(x, y, z, f' {j}', fontsize=7, color=color, alpha=0.7)
+
+    ax.scatter(0, 0, 0, c='red', marker='^', s=250, label='Cámara 1 (origen)')
+    C2 = (-R.T @ t_escalada).ravel()
+    ax.scatter(C2[0], C2[1], C2[2], c='blue', marker='^', s=250, label='Cámara 2')
+
+    all_pts = np.vstack([puntos_3d, [[0, 0, 0]], [C2]])
+    escala = max(np.max(np.ptp(all_pts, axis=0)) * 0.12, 0.05)
+    _dibujar_frustum(ax, np.array([0, 0, 0]), np.eye(3), escala, 'red')
+    _dibujar_frustum(ax, C2, R.T, escala, 'blue')
+
+    _configurar_ejes(ax, all_pts, titulo)
+    plt.tight_layout()
+    plt.show()
