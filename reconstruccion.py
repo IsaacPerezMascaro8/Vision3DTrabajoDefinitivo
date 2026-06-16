@@ -11,8 +11,6 @@ Todo implementado con NumPy (sin recoverPose ni triangulatePoints).
 
 import numpy as np
 import cv2
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -199,61 +197,136 @@ def error_reproyeccion(K, R, t, X, pts1, pts2):
 # Visualización 3D
 # ============================================================================
 
-_COLORS = ['#e6194b','#3cb44b','#4363d8','#f58231','#911eb4',
-           '#42d4f4','#f032e6','#bfef45','#fabed4','#469990']
+# Paleta de colores distinguibles para los IDs de ArUco
+_ARUCO_COLORS = [
+    '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+    '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990',
+    '#dcbeff', '#9A6324', '#800000', '#aaffc3', '#808000',
+    '#ffd8b1', '#000075', '#a9a9a9',
+]
 
-def visualizar_3d(X, marker_ids, R, t, outdir, titulo="Reconstruccion_3D"):
+def visualizar_reconstruccion_3d(puntos_3d, aruco_ids, R, t_escalada,
+                                  titulo="Reconstrucción 3D métrica"):
     """
-    Gráfico 3D con nube de puntos coloreada por marcador, posiciones
-    de cámaras, ejes de orientación y frustums.
+    Genera un gráfico 3D agrupado por ArUco.
+
+    Parámetros
+    ----------
+    puntos_3d : np.ndarray (Nx3)
+        Puntos 3D triangulados y ya escalados a metros.
+    aruco_ids : np.ndarray (N,)
+        ID de ArUco correspondiente a cada punto (misma longitud que puntos_3d).
+    R : np.ndarray (3x3)
+        Rotación de la cámara 2 respecto a la cámara 1.
+    t_escalada : np.ndarray (3x1)
+        Vector de traslación escalado a metros.
+    titulo : str
+        Título del gráfico.
     """
+
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection='3d')
 
-    unique_ids = np.unique(marker_ids)
+    # Nube de puntos agrupada por ArUco ID
+    unique_ids = np.unique(aruco_ids)
     for idx, aid in enumerate(unique_ids):
-        c = _COLORS[idx % len(_COLORS)]
-        mask = marker_ids == aid
-        pts = X[mask]
-        ax.scatter(pts[:,0], pts[:,1], pts[:,2], c=c, s=60, alpha=0.9,
-                   edgecolors='k', linewidths=0.4, label=f'ArUco {aid}')
+        color = _ARUCO_COLORS[idx % len(_ARUCO_COLORS)]
+        mask = aruco_ids == aid
+        pts = puntos_3d[mask]
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                   c=color, marker='o', s=60, alpha=0.9,
+                   edgecolors='k', linewidths=0.4,
+                   label=f'ArUco ID {aid}')
+        # Anotar las esquinas con números pequeños
         for j, (x, y, z) in enumerate(pts):
-            ax.text(x, y, z, f' {j}', fontsize=7, color=c)
+            ax.text(x, y, z, f' {j}', fontsize=7, color=color, alpha=0.7)
 
-    # Cámaras
-    ax.scatter(0, 0, 0, c='red', marker='^', s=250, zorder=5, label='Cám 1')
-    C2 = (-R.T @ t).ravel()
-    ax.scatter(C2[0], C2[1], C2[2], c='blue', marker='^', s=250, zorder=5, label='Cám 2')
+    # Cámara 1 — en el origen
+    ax.scatter(0, 0, 0, c='red', marker='^', s=250, zorder=5,
+               edgecolors='darkred', linewidths=1.2, label='Cámara 1 (origen)')
 
-    # Baseline
-    ax.plot([0, C2[0]], [0, C2[1]], [0, C2[2]], 'k--', lw=1, alpha=0.5, label='Baseline')
+    # Cámara 2 — centro óptico real C₂ = −Rᵀ · t_escalada
+    C2 = (-R.T @ t_escalada).ravel()
+    ax.scatter(C2[0], C2[1], C2[2], c='blue', marker='^', s=250, zorder=5,
+               edgecolors='darkblue', linewidths=1.2, label='Cámara 2')
 
-    # Ejes
-    all_pts = np.vstack([X, [[0,0,0]], [C2]])
-    esc = np.max(np.ptp(all_pts, axis=0)) * 0.12
-    if esc < 1e-6: esc = 0.05
-    for eje, col in zip(np.eye(3), ['r','g','b']):
-        ax.quiver(0,0,0, eje[0],eje[1],eje[2], length=esc, color=col, lw=2)
-    for eje, col in zip(R.T, ['r','g','b']):
-        ax.quiver(C2[0],C2[1],C2[2], eje[0],eje[1],eje[2],
-                  length=esc, color=col, lw=2, alpha=0.6)
+    # Ejes de orientación de cada cámara (R, G, B → X, Y, Z)
+    all_pts = np.vstack([puntos_3d, [[0, 0, 0]], [C2]])
+    escala_ejes = np.max(np.ptp(all_pts, axis=0)) * 0.12
+    if escala_ejes < 1e-6:
+        escala_ejes = 0.05
 
-    ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
-    ax.set_title(titulo.replace('_',' '), fontweight='bold')
-    ax.legend(loc='upper left', fontsize=8)
+    eje_labels = ['X', 'Y', 'Z']
+    eje_colors = ['r', 'g', 'b']
 
-    rng = np.max(np.ptp(all_pts, axis=0)) * 0.6
-    if rng < 1e-6: rng = 1.0
+    for eje, col, lbl in zip(np.eye(3), eje_colors, eje_labels):
+        ax.quiver(0, 0, 0, eje[0], eje[1], eje[2],
+                  length=escala_ejes, color=col, linewidth=2, arrow_length_ratio=0.15)
+
+    for eje, col in zip(R.T, eje_colors):
+        ax.quiver(C2[0], C2[1], C2[2], eje[0], eje[1], eje[2],
+                  length=escala_ejes, color=col, linewidth=2,
+                  alpha=0.6, arrow_length_ratio=0.15)
+
+    ax.plot([0, C2[0]], [0, C2[1]], [0, C2[2]],
+            'k--', linewidth=1.0, alpha=0.5, label='Baseline')
+
+    def _dibujar_frustum(ax, centro, R_cam, escala, color, alpha_face=0.12):
+        hw = escala * 0.55
+        hh = escala * 0.40
+        d  = escala * 0.9
+
+        esquinas_local = np.array([
+            [-hw, -hh, d],
+            [ hw, -hh, d],
+            [ hw,  hh, d],
+            [-hw,  hh, d],
+        ])
+
+        esquinas_world = (R_cam @ esquinas_local.T).T + centro
+
+        verts = [esquinas_world.tolist()]
+        poly = Poly3DCollection(verts, alpha=alpha_face, facecolors=color,
+                                edgecolors=color, linewidths=1.2)
+        ax.add_collection3d(poly)
+
+        for corner in esquinas_world:
+            ax.plot([centro[0], corner[0]],
+                    [centro[1], corner[1]],
+                    [centro[2], corner[2]],
+                    color=color, linewidth=0.8, alpha=0.45)
+
+        for i in range(4):
+            j = (i + 1) % 4
+            ax.plot([esquinas_world[i, 0], esquinas_world[j, 0]],
+                    [esquinas_world[i, 1], esquinas_world[j, 1]],
+                    [esquinas_world[i, 2], esquinas_world[j, 2]],
+                    color=color, linewidth=1.2, alpha=0.7)
+
+    _dibujar_frustum(ax, np.array([0, 0, 0]), np.eye(3), escala_ejes, 'red')
+    _dibujar_frustum(ax, C2, R.T, escala_ejes, 'blue')
+
+    ax.set_xlabel('X (metros)', fontsize=12, labelpad=10)
+    ax.set_ylabel('Y (metros)', fontsize=12, labelpad=10)
+    ax.set_zlabel('Z — Profundidad (metros)', fontsize=12, labelpad=10)
+    ax.set_title(titulo, fontsize=14, fontweight='bold', pad=20)
+    ax.legend(loc='upper left', fontsize=9, framealpha=0.85)
+
+    max_range = np.max(np.ptp(all_pts, axis=0)) * 0.6
+    if max_range < 1e-6:
+        max_range = 1.0
     mid = np.mean(all_pts, axis=0)
-    ax.set_xlim(mid[0]-rng, mid[0]+rng)
-    ax.set_ylim(mid[1]-rng, mid[1]+rng)
-    ax.set_zlim(mid[2]-rng, mid[2]+rng)
+    ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
+    ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
+    ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
+
     ax.invert_yaxis()
-    try: ax.set_box_aspect([1,1,1])
-    except: pass
+    ax.invert_xaxis()
+
+    try:
+        ax.set_box_aspect([1, 1, 1])
+    except AttributeError:
+        pass
 
     plt.tight_layout()
-    path = f"{outdir}/{titulo}.png"
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Guardado: {path}")
+    plt.show()

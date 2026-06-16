@@ -7,15 +7,13 @@ Etapas 0-10: ArUco → F → E → Pose → Triangulación → Rectificación �
 import os, sys
 import numpy as np
 import cv2
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from geometria_epipolar import (obtener_correspondencias, ocho_puntos_normalizado,
                                  ransac_fundamental, calcular_esencial,
                                  normalizar_puntos, _error_epipolar_simetrico)
 from reconstruccion import (seleccionar_pose, fijar_escala_metrica,
-                             triangular_puntos, error_reproyeccion, visualizar_3d)
+                             triangular_puntos, error_reproyeccion, visualizar_reconstruccion_3d)
 from visualizacion import (visualizar_correspondencias, visualizar_lineas_epipolares,
                             visualizar_rectificacion)
 
@@ -392,7 +390,7 @@ def main():
     err1, err2 = error_reproyeccion(K, R, t_esc, X, p1_in, p2_in)
     print(f"  Error reproyección: cam1={err1:.4f} px, cam2={err2:.4f} px")
     
-    visualizar_3d(X, mids_in, R, t_esc, OUTDIR)
+    visualizar_reconstruccion_3d(X, mids_in, R, t_esc)
     
     # --- Etapa 9: Rectificación ---
     img_rect1, img_rect2, R1, R2, P1r, P2r, Q = rectificar_estereo(

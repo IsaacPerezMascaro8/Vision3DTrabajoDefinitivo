@@ -10,8 +10,6 @@ Funciones de visualización para el pipeline de visión 3D:
 import numpy as np
 import cv2
 import os
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
