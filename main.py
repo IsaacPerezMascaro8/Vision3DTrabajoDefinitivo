@@ -8,6 +8,8 @@ import os, sys
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as patches
 
 from geometria_epipolar import (obtener_correspondencias, ocho_puntos_normalizado,
                                  ransac_fundamental, calcular_esencial,
@@ -54,6 +56,76 @@ def cargar_imagenes():
             print(f"  ⚠️  Resolución inesperada (esperada {EXPECTED[1]}x{EXPECTED[0]})")
     return il, ir
 
+
+
+def generar_grafica_ssd_diapositiva(imgL, imgR, ptL, outdir):
+    print("\n" + "="*70)
+    print("EXTRA 1 — Generando gráfica SSD (Búsqueda de Correspondencia 1D)")
+    print("="*70)
+
+    grayL = cv2.cvtColor(imgL, cv2.COLOR_BGR2GRAY)
+    grayR = cv2.cvtColor(imgR, cv2.COLOR_BGR2GRAY)
+    h, w = grayL.shape
+
+    x_L, y_L = int(ptL[0]), int(ptL[1])
+    window_size = 51 
+    half_w = window_size // 2
+
+    template = grayL[y_L-half_w:y_L+half_w+1, x_L-half_w:x_L+half_w+1].astype(np.float32)
+    x_r_vals, ssd_vals = [], []
+
+    rango_busqueda = 800
+    x_min = max(half_w, x_L - rango_busqueda)
+    x_max = min(w - half_w - 1, x_L + 50)
+    
+    for x_R in range(x_min, x_max, 5): 
+        roi = grayR[y_L-half_w:y_L+half_w+1, x_R-half_w:x_R+half_w+1].astype(np.float32)
+        ssd = np.sum((template - roi)**2)
+        x_r_vals.append(x_R)
+        ssd_vals.append(ssd)
+
+    min_idx = np.argmin(ssd_vals)
+    best_x_R = x_r_vals[min_idx]
+
+    fig = plt.figure(figsize=(15, 10))
+    gs = gridspec.GridSpec(2, 2, height_ratios=[1.2, 1])
+    zoom_margin = 800
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(cv2.cvtColor(imgL, cv2.COLOR_BGR2RGB))
+    ax1.axhline(y=y_L, color='magenta', linewidth=1.5)
+    ax1.text(x_L - zoom_margin + 50, y_L - 30, 'scanline', color='magenta', fontsize=14, fontweight='bold')
+    rect = patches.Rectangle((x_L-half_w, y_L-half_w), window_size, window_size, linewidth=2, edgecolor='red', facecolor='none')
+    ax1.add_patch(rect)
+    ax1.set_title("Izquierda", fontsize=16)
+    ax1.axis('off')
+    ax1.set_xlim(max(0, x_L - zoom_margin), min(w, x_L + zoom_margin//2))
+    ax1.set_ylim(min(h, y_L + zoom_margin//2), max(0, y_L - zoom_margin//2)) 
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(cv2.cvtColor(imgR, cv2.COLOR_BGR2RGB))
+    ax2.axhline(y=y_L, color='magenta', linewidth=1.5)
+    ax2.axvline(x=best_x_R, color='red', linewidth=1.5)
+    ax2.set_title("Derecha", fontsize=16)
+    ax2.axis('off')
+    ax2.set_xlim(max(0, x_L - zoom_margin), min(w, x_L + zoom_margin//2))
+    ax2.set_ylim(min(h, y_L + zoom_margin//2), max(0, y_L - zoom_margin//2))
+
+    ax3 = fig.add_subplot(gs[1, 1], sharex=ax2)
+    ax3.plot(x_r_vals, ssd_vals, color='darkblue', linewidth=2)
+    ax3.axvline(x=best_x_R, color='red', linewidth=1.5)
+    ax3.set_title("SSD", fontsize=16)
+    ax3.set_xlabel("Píxeles (Eje X)", fontsize=12)
+    ax3.set_ylabel("Error Cuadrático", fontsize=12)
+    ax3.grid(True, alpha=0.3)
+
+    plt.suptitle("Búsqueda de correspondencia (SSD)", fontsize=24, fontweight='bold')
+    plt.tight_layout()
+    
+    ruta_guardado = os.path.join(outdir, 'grafica_busqueda_SSD.png')
+    fig.savefig(ruta_guardado, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Gráfica guardada en: {ruta_guardado}")
 
 
 # ============================================================================
@@ -125,6 +197,12 @@ def main():
     
     img_rect2 = img_rect2_opt
     visualizar_rectificacion(img_rect1, img_rect2, OUTDIR, pts_rect=ptsL_rect)
+    
+    # Extraer gráfica SSD de validación en un punto con textura (ArUco)
+    # Seleccionamos la primera esquina del primer ArUco detectado y rectificado
+    if len(ptsL_rect) > 0:
+        punto_test = ptsL_rect[0] 
+        generar_grafica_ssd_diapositiva(img_rect1, img_rect2, punto_test, OUTDIR)
     
     # --- Etapa 10: Disparidad densa ---
     C1 = np.array([0.0, 0.0, 0.0])
